@@ -2,6 +2,8 @@
 
 A PyTorch implementation of Tensor Product Attention from the [T6 paper](https://arxiv.org/abs/2501.06425) - "Tensor Product Attention Is All You Need".
 
+![QKV Factorization](assets/qkv_factorization.png)
+
 Please refer to their [homepage](https://tensorgi.github.io/T6/) for more information.
 
 ## Benefits of TPA

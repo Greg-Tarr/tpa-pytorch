@@ -21,15 +21,15 @@ Please refer to their [homepage](https://tensorgi.github.io/T6/) for more inform
 ## Installation
 
 ```bash
-git clone https://github.com/Greg-Tarr/tpa.git
-cd tpa
+git clone https://github.com/Greg-Tarr/tpa_pytorch.git
+cd tpa_pytorch
 uv run tpa.py
 ```
 
 ## Usage
 
 ```python
-from tpa import TPAttention
+from tpa_pytorch import TPAttention
 
 # Initialize the attention module
 model = TPAttention(

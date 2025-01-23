@@ -54,6 +54,8 @@ Execution results:
     Speedup from KV cache: 6.09x
 """
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -65,8 +67,10 @@ from torch.nn.attention.flex_attention import (
 
 Tensor = torch.Tensor
 
+
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
+
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int) -> None:
@@ -74,6 +78,7 @@ class CastedLinear(nn.Linear):
 
     def forward(self, input: Tensor) -> Tensor:
         return F.linear(input, self.weight.to(input.dtype))
+
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, base: int = 10000):
@@ -90,10 +95,20 @@ class Rotary(nn.Module):
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x)
 
+
 def create_causal_mod(cache_len: int):
     def causal_mod(b, h, q_idx, kv_idx):
         return kv_idx <= q_idx + cache_len
+
     return causal_mod
+
+
+class KVCache(nn.Module):
+    def __init__(self, data: Tensor | None, offset: int = 0) -> None:
+        self.data = data
+        self.offset = offset
+        self.enabled = True
+
 
 class TPAttention(nn.Module):
     """Tensor Product Attention with factorizes Q/K/V values"""
@@ -102,17 +117,21 @@ class TPAttention(nn.Module):
         self,
         d_model: int,
         n_head: int,
+        max_seq_len: int = 8192,
         r_Q: int = 1,
         r_K: int = 1,
         r_V: int = 1,
     ) -> None:
         super().__init__()
-        assert d_model % n_head == 0, f"d_model ({d_model}) must be evenly divisible by n_head ({n_head})"
+        assert (
+            d_model % n_head == 0
+        ), f"d_model ({d_model}) must be evenly divisible by n_head ({n_head})"
         d_head = d_model // n_head
 
         self.nh = n_head
         self.dh = d_head
         self.ch = n_head + d_head
+        self.max_seq_len = max_seq_len
 
         self.r_Q = r_Q
         self.r_K = r_K
@@ -123,6 +142,7 @@ class TPAttention(nn.Module):
         self.W_o = CastedLinear(d_model, d_model)
 
         self.rotary = Rotary(dim=d_head)
+        self.cache = KVCache(data=None, offset=0)
 
         ab_q_tensor = self.ab_q.weight.view(d_model, r_Q, n_head + d_head)
         nn.init.xavier_uniform_(ab_q_tensor)
@@ -133,41 +153,62 @@ class TPAttention(nn.Module):
         nn.init.xavier_uniform_(self.W_o.weight)
 
     @torch.compile
-    def factorized_qkv(self, x: Tensor, kv_cache: Tensor):
+    def factorized_qkv(self, x: Tensor):
         B, T, D = x.shape
         nh, dh = self.nh, self.dh
+        offset = self.cache.offset
 
+        # Projections Q for each of R_x, a(nh) & b(dh)
         abq = self.ab_q(x).reshape(B, T, self.r_Q, nh + dh)
-        abkv = self.ab_kv(x).reshape(B, T, self.r_K + self.r_V, nh + dh)
-        abkv[:, :, :, nh:] = self.rotary(abkv[:, :, :, nh:], kv_cache.size(1)) # TODO: add rms norm
-        abkv = torch.cat((kv_cache, abkv), dim=1) # TODO: pre-allocate max_seq_len
-
         a_q = abq[..., :nh]
         b_q = abq[..., nh:]
-        a_k = abkv[..., :self.r_K, :nh]
-        b_k = abkv[..., :self.r_K, nh:]
-        a_v = abkv[..., self.r_K:, :nh]
-        b_v = abkv[..., self.r_K:, nh:]
 
-        q = torch.einsum("btrh, btrd -> bthd", a_q, b_q) * (1/self.r_Q)
-        k = torch.einsum("btrh, btrd -> bthd", a_k, b_k) * (1/self.r_K)
-        v = torch.einsum("btrh, btrd -> bthd", a_v, b_v) * (1/self.r_V)
+        # Projection for KV for each of R_x, a(nh) & b(dh)
+        abkv = self.ab_kv(x).reshape(B, T, self.r_K + self.r_V, nh + dh)
 
-        return (q, k, v), abkv
+        # Apply rotary to the dh section of K&V offset by cache
+        abkv[:, :, :, nh:] = self.rotary(abkv[:, :, :, nh:], offset)
 
-    def forward(self, x: Tensor, kv_cache: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        if self.cache.enabled:
+            # Insert into cache
+            self.cache.data[
+                :, self.cache.offset : self.cache.offset + abkv.size(1), :, :
+            ] = abkv
+            self.cache.offset += abkv.size(1)
+            abkv = self.cache.data
+
+        # Extract current kv cache
+        a_k = abkv[:, : self.cache.offset, : self.r_K, :nh]
+        b_k = abkv[:, : self.cache.offset, : self.r_K, nh:]
+        a_v = abkv[:, : self.cache.offset, self.r_K :, :nh]
+        b_v = abkv[:, : self.cache.offset, self.r_K :, nh:]
+
+        q = torch.einsum("btrh, btrd -> bthd", a_q, b_q) * (1 / self.r_Q)
+        k = torch.einsum("btrh, btrd -> bthd", a_k, b_k) * (1 / self.r_K)
+        v = torch.einsum("btrh, btrd -> bthd", a_v, b_v) * (1 / self.r_V)
+
+        return q, k, v
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         B, T, D = x.shape
         nh, dh = self.nh, self.dh
-        if kv_cache is None:
-            kv_cache = torch.zeros((B, 0, self.r_K + self.r_V, nh + dh), device=x.device, dtype=self.ab_kv.weight.dtype)
+
+        # Initialize kv cache
+        if self.cache.enabled and self.cache.data is None:
+            self.cache.data = torch.zeros(
+                (B, self.max_seq_len, self.r_K + self.r_V, nh + dh),
+                device=x.device,
+                dtype=self.ab_kv.weight.dtype,
+            )
 
         # Factorization w/ cache
-        (q, k, v), kv_cache = self.factorized_qkv(x, kv_cache)
+        q, k, v = self.factorized_qkv(x)
 
         # Attn operation
-        causal_mod = create_causal_mod(kv_cache.size(1) - T)
+        # TODO: support batches with masking
+        causal_mod = create_causal_mod(self.cache.offset - T)  # Pre-added size
         block_mask = create_block_mask(
-            causal_mod, B=None, H=None, Q_LEN=T, KV_LEN=k.size(1)
+            causal_mod, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)
         )
 
         y = flex_attention(
@@ -187,8 +228,7 @@ class TPAttention(nn.Module):
         )
         y = y.transpose(1, 2).contiguous().view_as(x)
         y = self.W_o(y)
-        return y, kv_cache
-
+        return y
 
 
 if __name__ == "__main__":
@@ -200,13 +240,18 @@ if __name__ == "__main__":
 
     # Create attention block
     device = "cuda"
-    model = TPAttention(
-        d_model=D_MODEL,
-        n_head=N_HEAD,
-        r_Q=1,
-        r_K=1,
-        r_V=1,
-    ).to(device).bfloat16()
+    model = (
+        TPAttention(
+            d_model=D_MODEL,
+            n_head=N_HEAD,
+            max_seq_len=T,
+            r_Q=1,
+            r_K=1,
+            r_V=1,
+        )
+        .to(device)
+        .bfloat16()
+    )
     for param in model.named_parameters():
         if isinstance(param, CastedLinear):
             param.float()
@@ -219,9 +264,10 @@ if __name__ == "__main__":
 
     # Forward pass (warmup)
     print("\nTesting forward pass...")
+    model.cache.enabled = False
     with torch.no_grad():
         for _ in range(25):
-            out, _ = model(prompt)
+            out = model(prompt)
     torch.cuda.synchronize()
     print(f"Output shape: {out.shape}")
 
@@ -230,9 +276,10 @@ if __name__ == "__main__":
     end_time = torch.cuda.Event(enable_timing=True)
     start_time.record()
 
+    model.cache.enabled = False
     with torch.no_grad():
         for _ in range(1000):
-            out, _ = model(prompt)
+            out = model(prompt)
 
     end_time.record()
     torch.cuda.synchronize()
@@ -243,19 +290,24 @@ if __name__ == "__main__":
     print(f"Tokens per second (prefill): {tokens_per_sec:.1f}")
 
     print("\nTesting chunked/autoregressive generation...")
+
     def test_chunked_generation():
         # Test with full prompt
+        model.cache.enabled = False
+        model.cache.data = None
         with torch.no_grad():
-            out_full, _ = model(prompt)
+            out_full = model(prompt)
 
         # Test with chunked prompt
         split_idx = prompt_len // 2
         prompt_chunk1 = prompt[:, :split_idx]
         prompt_chunk2 = prompt[:, split_idx:]
 
+        model.cache.enabled = True
+        model.cache.data = None
         with torch.no_grad():
-            out_chunk1, kv_cache = model(prompt_chunk1)
-            out_chunk2, _ = model(prompt_chunk2, kv_cache)
+            out_chunk1 = model(prompt_chunk1)
+            out_chunk2 = model(prompt_chunk2)
             out_chunked = torch.cat([out_chunk1, out_chunk2], dim=1)
 
         # Compare results
@@ -268,6 +320,7 @@ if __name__ == "__main__":
     test_chunked_generation()
 
     print("\nTesting generation...")
+
     def test_generation(use_cache: bool):
         tokens = prompt.clone()
         start_time = torch.cuda.Event(enable_timing=True)
@@ -275,15 +328,17 @@ if __name__ == "__main__":
         start_time.record()
 
         # Forward passes
+        model.cache.enabled = use_cache
+        model.cache.data = None
         with torch.no_grad():
-            tokens, kv_cache = model(tokens, None)
+            tokens = model(tokens)
             pred = tokens
 
             for i in range(gen_len):
                 if use_cache:
-                    pred, kv_cache = model(pred[:, -1:], kv_cache)
+                    pred, kv_cache = model(pred[:, -1:])
                 else:
-                    pred, _ = model(tokens, None)
+                    pred, _ = model(tokens)
                     tokens = torch.cat([tokens, pred[:, -1:]], dim=1)
 
         end_time.record()

@@ -8,53 +8,84 @@ https://arxiv.org/abs/2501.06425
 Done without reference to the source code, so may not be faithful to the
 original work. Basic idea is to use tensor decompositions to represent
 Q/K/Vs by factorizing them into low-rank components. Has a 10x smaller
-kv_cache and (apparently) no degradation to perplexity tested up to
-~700m param models.
+kv_cache and no degradation to perplexity tested up to ~700m param models.
 
 TODO:
-- kernel to compute attn directly from factors
-- support higher-order tpa
-- use max_seq_len and pre-allocate kvcache
+    - kernel to compute attn directly from factors
+    - support higher-order tpa
+
+Changelog:
+    - added max_seq_len to pre-allocate kvcache
+    - made cache a separate class
+    - made cache an arguement to the forward pass to allow torch.compile
 
 Execution results:
 
 > nvidia-smi
-    Sat Jan 18 19:56:41 2025
+    Thu Jan 23 17:09:29 2025
     +-----------------------------------------------------------------------------------------+
-    | NVIDIA-SMI 560.35.03              Driver Version: 560.35.03      CUDA Version: 12.6     |
+    | NVIDIA-SMI 565.57.01              Driver Version: 565.57.01      CUDA Version: 12.7     |
     |-----------------------------------------+------------------------+----------------------+
     | GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
     | Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
     |                                         |                        |               MIG M. |
     |=========================================+========================+======================|
-    |   0  NVIDIA GeForce RTX 4090        On  |   00000000:02:00.0 Off |                  Off |
-    |  0%   37C    P8             22W /  450W |       2MiB /  24564MiB |      0%      Default |
+    |   0  NVIDIA A40                     On  |   00000000:05:00.0 Off |                    0 |
+    |  0%   38C    P8             31W /  300W |       1MiB /  46068MiB |      0%      Default |
     |                                         |                        |                  N/A |
     +-----------------------------------------+------------------------+----------------------+
 
 > uv run tpa.py
 
-    Testing forward pass...
+    Warming up model...
     Output shape: torch.Size([1, 2048, 8192])
 
-    Benchmarking forward pass...
-    Output shape: torch.Size([1, 2048, 8192])
-    Avg time per step: 6.15ms
-    Tokens per second (prefill): 332825.2
+    Benchmarking With Cache prefill...
+    Avg time per step: 9.35ms
+    Tokens per second (prefill): 219072.6
 
-    Testing chunked/autoregressive generation...
-    Maximum difference between full and chunked: 0.00000716
-    Mean difference between full and chunked: 0.00000010
+    Testing chunked/autoregressive generation with With Cache...
+    Maximum difference between full and chunked: 0.00000072
+    Mean difference between full and chunked: 0.00000001
     Outputs match: True
 
-    Testing generation...
-    With cache: 3696.34ms (554.1 tokens/sec)
-    No cache: 22526.97ms (90.9 tokens/sec)
+    Testing generation with With Cache...
 
-    Speedup from KV cache: 6.09x
+    Total Time: 6257.58ms (327.3 tok/sec)
+    Time per token: 3.06ms
+    Max throughput: 327.3 tok/sec
+    With Cache: 6257.58ms (327.3 tokens/sec)
+
+    Warming up model...
+    Output shape: torch.Size([1, 2048, 8192])
+
+    Benchmarking No Cache prefill...
+    Avg time per step: 9.86ms
+    Tokens per second (prefill): 207768.2
+
+    Testing generation with No Cache...
+
+    Total Time: 49092.46ms (41.7 tok/sec)
+    Time per token: 23.97ms
+    Max throughput: 41.7 tok/sec
+    No Cache: 49092.46ms (41.7 tokens/sec)
+
+    Comparing with and without cache speeds.
+
+    Testing generation with No Cache...
+
+    Total Time: 51251.46ms (40.0 tok/sec)
+    Time per token: 25.03ms
+    Max throughput: 40.0 tok/sec
+
+    Testing generation with With Cache...
+
+    Total Time: 4204.21ms (487.1 tok/sec)
+    Time per token: 2.05ms
+    Max throughput: 487.1 tok/sec
+
+    Speedup from KV cache: 12.19x
 """
-
-from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -102,12 +133,39 @@ def create_causal_mod(cache_len: int):
 
     return causal_mod
 
+class NoKVCache(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.offset = 0
+
+    def zero(self):
+        self.offset = 0
+
+    def forward(self, abkv: Tensor) -> Tensor:
+        self.offset += abkv.size(1)
+        return abkv
 
 class KVCache(nn.Module):
-    def __init__(self, data: Tensor | None, offset: int = 0) -> None:
-        self.data = data
-        self.offset = offset
-        self.enabled = True
+    def __init__(self, kv_cache_shape: tuple = None) -> None:
+        super().__init__()
+        self.kv_cache_shape = kv_cache_shape
+        self.register_buffer('data', torch.zeros((1, *self.kv_cache_shape)))
+        self.zero()
+
+    def zero(self):
+        self.offset = 0
+        self.data.zero_()
+
+    def forward(self, abkv: Tensor) -> Tensor:
+        assert self.offset + abkv.size(1) <= self.data.size(1), "KV Cache Exceeded"
+
+        self.data = self.data.to(abkv.dtype)
+        self.data[
+            :, self.offset : self.offset + abkv.size(1), :, :
+        ] = abkv
+        self.offset += abkv.size(1)
+
+        return self.data[:, :self.offset]
 
 
 class TPAttention(nn.Module):
@@ -142,7 +200,6 @@ class TPAttention(nn.Module):
         self.W_o = CastedLinear(d_model, d_model)
 
         self.rotary = Rotary(dim=d_head)
-        self.cache = KVCache(data=None, offset=0)
 
         ab_q_tensor = self.ab_q.weight.view(d_model, r_Q, n_head + d_head)
         nn.init.xavier_uniform_(ab_q_tensor)
@@ -152,11 +209,9 @@ class TPAttention(nn.Module):
         self.ab_kv.weight.data = ab_kv_tensor.view_as(self.ab_kv.weight)
         nn.init.xavier_uniform_(self.W_o.weight)
 
-    @torch.compile
-    def factorized_qkv(self, x: Tensor):
+    def factorized_qkv(self, x: Tensor, cache: KVCache | NoKVCache) -> tuple[Tensor, Tensor, Tensor]:
         B, T, D = x.shape
         nh, dh = self.nh, self.dh
-        offset = self.cache.offset
 
         # Projections Q for each of R_x, a(nh) & b(dh)
         abq = self.ab_q(x).reshape(B, T, self.r_Q, nh + dh)
@@ -167,21 +222,16 @@ class TPAttention(nn.Module):
         abkv = self.ab_kv(x).reshape(B, T, self.r_K + self.r_V, nh + dh)
 
         # Apply rotary to the dh section of K&V offset by cache
-        abkv[:, :, :, nh:] = self.rotary(abkv[:, :, :, nh:], offset)
+        abkv[:, :, :, nh:] = self.rotary(abkv[:, :, :, nh:], cache.offset)
 
-        if self.cache.enabled:
-            # Insert into cache
-            self.cache.data[
-                :, self.cache.offset : self.cache.offset + abkv.size(1), :, :
-            ] = abkv
-            self.cache.offset += abkv.size(1)
-            abkv = self.cache.data
+        # Insert and retrieve cache (noop if no cache)
+        kv_cache = cache(abkv)
 
         # Extract current kv cache
-        a_k = abkv[:, : self.cache.offset, : self.r_K, :nh]
-        b_k = abkv[:, : self.cache.offset, : self.r_K, nh:]
-        a_v = abkv[:, : self.cache.offset, self.r_K :, :nh]
-        b_v = abkv[:, : self.cache.offset, self.r_K :, nh:]
+        a_k = kv_cache[..., : self.r_K, :nh]
+        b_k = kv_cache[..., : self.r_K, nh:]
+        a_v = kv_cache[..., self.r_K :, :nh]
+        b_v = kv_cache[..., self.r_K :, nh:]
 
         q = torch.einsum("btrh, btrd -> bthd", a_q, b_q) * (1 / self.r_Q)
         k = torch.einsum("btrh, btrd -> bthd", a_k, b_k) * (1 / self.r_K)
@@ -189,26 +239,17 @@ class TPAttention(nn.Module):
 
         return q, k, v
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, cache: KVCache | NoKVCache) -> tuple[Tensor, Tensor]:
         B, T, D = x.shape
-        nh, dh = self.nh, self.dh
-
-        # Initialize kv cache
-        if self.cache.enabled and self.cache.data is None:
-            self.cache.data = torch.zeros(
-                (B, self.max_seq_len, self.r_K + self.r_V, nh + dh),
-                device=x.device,
-                dtype=self.ab_kv.weight.dtype,
-            )
 
         # Factorization w/ cache
-        q, k, v = self.factorized_qkv(x)
+        q, k, v = self.factorized_qkv(x, cache)
 
         # Attn operation
         # TODO: support batches with masking
-        causal_mod = create_causal_mod(self.cache.offset - T)  # Pre-added size
+        causal_mod = create_causal_mod(cache.offset - T) # Pre-offset size
         block_mask = create_block_mask(
-            causal_mod, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)
+            causal_mod, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1), _compile=True
         )
 
         y = flex_attention(
@@ -230,17 +271,17 @@ class TPAttention(nn.Module):
         y = self.W_o(y)
         return y
 
-
 if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
 
+    # Model configuration
     D_MODEL = 8192
     N_HEAD = D_MODEL // 128
     T = 4096
-
-    # Create attention block
     device = "cuda"
-    model = (
+
+    # Create both non-cached and cached models
+    model_nocache = (
         TPAttention(
             d_model=D_MODEL,
             n_head=N_HEAD,
@@ -251,63 +292,78 @@ if __name__ == "__main__":
         )
         .to(device)
         .bfloat16()
+        .eval()
     )
-    for param in model.named_parameters():
-        if isinstance(param, CastedLinear):
-            param.float()
-    flex_attention = torch.compile(flex_attention)
+    no_cache = NoKVCache()
+    model_nocache = torch.compile(model_nocache)
 
-    # Prefill prompt
+    model_cache = (
+        TPAttention(
+            d_model=D_MODEL,
+            n_head=N_HEAD,
+            max_seq_len=T,
+            r_Q=1,
+            r_K=1,
+            r_V=1,
+        )
+        .to(device)
+        .bfloat16()
+        .eval()
+    )
+    kv_cache = KVCache(kv_cache_shape=(model_cache.max_seq_len, model_cache.r_K + model_cache.r_V, model_cache.nh + model_cache.dh)).to(device)
+    model_cache = torch.compile(model_cache)
+
+    # Test parameters
     prompt_len = 2048
     gen_len = 2048
     prompt = torch.randn((1, prompt_len, D_MODEL), device=device, dtype=torch.float32)
 
-    # Forward pass (warmup)
-    print("\nTesting forward pass...")
-    model.cache.enabled = False
-    with torch.no_grad():
-        for _ in range(25):
-            out = model(prompt)
-    torch.cuda.synchronize()
-    print(f"Output shape: {out.shape}")
-
-    print("\nBenchmarking forward pass...")
-    start_time = torch.cuda.Event(enable_timing=True)
-    end_time = torch.cuda.Event(enable_timing=True)
-    start_time.record()
-
-    model.cache.enabled = False
-    with torch.no_grad():
-        for _ in range(1000):
-            out = model(prompt)
-
-    end_time.record()
-    torch.cuda.synchronize()
-    elapsed_ms = start_time.elapsed_time(end_time)
-    tokens_per_sec = (prompt.size(1) * 1000 * 1000) / elapsed_ms
-    print(f"Output shape: {out.shape}")
-    print(f"Avg time per step: {elapsed_ms/1000:.2f}ms")
-    print(f"Tokens per second (prefill): {tokens_per_sec:.1f}")
-
-    print("\nTesting chunked/autoregressive generation...")
-
-    def test_chunked_generation():
-        # Test with full prompt
-        model.cache.enabled = False
-        model.cache.data = None
+    def warmup(model, cache):
+        print("\nWarming up model...")
         with torch.no_grad():
-            out_full = model(prompt)
+            for _ in range(25):
+                cache.zero()
+                out = model(prompt, cache)
+        torch.cuda.synchronize()
+        print(f"Output shape: {out.shape}")
+        return out
+
+    def benchmark_prefill(model, name, cache):
+        print(f"\nBenchmarking {name} prefill...")
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+
+        start_time.record()
+        with torch.no_grad():
+            for _ in range(1000):
+                cache.zero()
+                out = model(prompt, cache)
+        end_time.record()
+
+        torch.cuda.synchronize()
+        elapsed_ms = start_time.elapsed_time(end_time)
+        tokens_per_sec = (prompt.size(1) * 1000 * 1000) / elapsed_ms
+        print(f"Avg time per step: {elapsed_ms/1000:.2f}ms")
+        print(f"Tokens per second (prefill): {tokens_per_sec:.1f}")
+        return out
+
+    def test_chunked_generation(model, name, cache):
+        print(f"\nTesting chunked/autoregressive generation with {name}...")
+
+        # Test with full prompt
+        cache.zero()
+        with torch.no_grad():
+            out_full = model(prompt, cache)
 
         # Test with chunked prompt
         split_idx = prompt_len // 2
         prompt_chunk1 = prompt[:, :split_idx]
         prompt_chunk2 = prompt[:, split_idx:]
 
-        model.cache.enabled = True
-        model.cache.data = None
+        cache.zero()
         with torch.no_grad():
-            out_chunk1 = model(prompt_chunk1)
-            out_chunk2 = model(prompt_chunk2)
+            out_chunk1 = model(prompt_chunk1, cache)
+            out_chunk2 = model(prompt_chunk2, cache)
             out_chunked = torch.cat([out_chunk1, out_chunk2], dim=1)
 
         # Compare results
@@ -315,45 +371,57 @@ if __name__ == "__main__":
         mean_diff = torch.mean(torch.abs(out_full - out_chunked))
         print(f"Maximum difference between full and chunked: {max_diff:.8f}")
         print(f"Mean difference between full and chunked: {mean_diff:.8f}")
-        print(f"Outputs match: {mean_diff < 1e-3}")
+        print(f"Outputs match: {mean_diff < 1e-5}")
+        return out_full, out_chunked
 
-    test_chunked_generation()
-
-    print("\nTesting generation...")
-
-    def test_generation(use_cache: bool):
+    def test_generation(model, name, cache):
+        print(f"\nTesting generation with {name}...")
         tokens = prompt.clone()
         start_time = torch.cuda.Event(enable_timing=True)
         end_time = torch.cuda.Event(enable_timing=True)
-        start_time.record()
 
-        # Forward passes
-        model.cache.enabled = use_cache
-        model.cache.data = None
+        cache.zero()
+
+        start_time.record()
         with torch.no_grad():
-            tokens = model(tokens)
+            tokens = model(tokens, cache)
             pred = tokens
 
             for i in range(gen_len):
-                if use_cache:
-                    pred, kv_cache = model(pred[:, -1:])
-                else:
-                    pred, _ = model(tokens)
+                if isinstance(cache, KVCache):  # Using KVCache
+                    pred = model(pred[:, -1:], cache)
+                else:  # Using NoKVCache
+                    pred = model(tokens, cache)
                     tokens = torch.cat([tokens, pred[:, -1:]], dim=1)
 
         end_time.record()
         torch.cuda.synchronize()
         elapsed_ms = start_time.elapsed_time(end_time)
         tokens_per_sec = (gen_len * 1000) / elapsed_ms
+        print(f"\nTotal Time: {elapsed_ms:.2f}ms ({gen_len/elapsed_ms*1000:.1f} tok/sec)")
+        print(f"Time per token: {elapsed_ms/gen_len:.2f}ms")
+        print(f"Max throughput: {min(gen_len/elapsed_ms*1000,prompt_len*1000/elapsed_ms):.1f} tok/sec")
         return elapsed_ms, tokens_per_sec
 
-    # Test with cache
-    time_with_cache, tps_with_cache = test_generation(use_cache=True)
-    print(f"With cache: {time_with_cache:.2f}ms ({tps_with_cache:.1f} tokens/sec)")
+    # Test both models
+    for model, name, cache in [(model_cache, "With Cache", kv_cache), (model_nocache, "No Cache", no_cache)]:
+        # Warmup
+        warmup(model, cache)
 
-    # Test without cache
-    time_no_cache, tps_no_cache = test_generation(use_cache=False)
-    print(f"No cache: {time_no_cache:.2f}ms ({tps_no_cache:.1f} tokens/sec)")
+        # Benchmark prefill
+        benchmark_prefill(model, name, cache)
 
-    speedup = time_no_cache / time_with_cache
+        # Test chunked generation
+        if name == "With Cache": # Only test autoregression with cache addition
+            test_chunked_generation(model, name, cache)
+
+        # Test generation
+        time_ms, tps = test_generation(model, name, cache)
+        print(f"{name}: {time_ms:.2f}ms ({tps:.1f} tokens/sec)")
+
+    # Compare speedup
+    print("\nComparing with and without cache speeds.")
+    nocache_time, _ = test_generation(model_nocache, "No Cache", no_cache)
+    cache_time, _ = test_generation(model_cache, "With Cache", kv_cache)
+    speedup = nocache_time / cache_time
     print(f"\nSpeedup from KV cache: {speedup:.2f}x")

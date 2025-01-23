@@ -209,7 +209,7 @@ class TPAttention(nn.Module):
         self.ab_kv.weight.data = ab_kv_tensor.view_as(self.ab_kv.weight)
         nn.init.xavier_uniform_(self.W_o.weight)
 
-    def factorized_qkv(self, x: Tensor, cache: KVCache | NoKVCache) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, x: Tensor, cache: KVCache | NoKVCache) -> tuple[Tensor, Tensor]:
         B, T, D = x.shape
         nh, dh = self.nh, self.dh
 
@@ -233,17 +233,10 @@ class TPAttention(nn.Module):
         a_v = kv_cache[..., self.r_K :, :nh]
         b_v = kv_cache[..., self.r_K :, nh:]
 
+        # Do the a @ p operation and sum over r_X
         q = torch.einsum("btrh, btrd -> bthd", a_q, b_q) * (1 / self.r_Q)
         k = torch.einsum("btrh, btrd -> bthd", a_k, b_k) * (1 / self.r_K)
         v = torch.einsum("btrh, btrd -> bthd", a_v, b_v) * (1 / self.r_V)
-
-        return q, k, v
-
-    def forward(self, x: Tensor, cache: KVCache | NoKVCache) -> tuple[Tensor, Tensor]:
-        B, T, D = x.shape
-
-        # Factorization w/ cache
-        q, k, v = self.factorized_qkv(x, cache)
 
         # Attn operation
         # TODO: support batches with masking
